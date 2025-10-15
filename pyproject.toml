@@ -1,0 +1,12 @@
+[project]
+name = "dev-agent-webapp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.119.0",
+    "google-adk>=1.16.0",
+    "google-genai>=1.44.0",
+    "uvicorn>=0.37.0",
+]
