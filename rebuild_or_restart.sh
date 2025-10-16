@@ -45,7 +45,8 @@ case "$1" in
       -v "$PWD":/workspace \
       -w /workspace/app \
       --env-file ./.env \
-      ${IMAGE_NAME}:${TAG}
+      ${IMAGE_NAME}:${TAG} \
+      /bin/bash
     ;;
 
   start|restart)
