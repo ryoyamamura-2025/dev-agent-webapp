@@ -17,7 +17,7 @@ import vertexai
 
 from config import APP_CONFIG
 from agent_app import LocalApp
-from agent.agent import root_agent
+from agent.agent import available_tools, create_facilitator_agent
 
 # --- ロギング設定 ---
 logging.basicConfig(
@@ -62,13 +62,10 @@ async def lifespan(app: FastAPI):
             staging_bucket=f"gs://{bucket}"
         )
 
-        # 3. Agent のインスタンス化
-        logger.info(f"Agent を取得中...")
-        agent = LocalApp(agent=root_agent)
-        
-        # 4. 取得したクライアントをアプリケーションの状態として保持
-        app_state["local_agent"] = agent
-        logger.info("Agentの初期化が正常に完了しました。アプリケーションがリクエストを受け付けます。")
+        # 3. アクティブなセッションとエージェントインスタンスを保持する辞書を初期化
+        app_state["local_app_cache"] = {} # ツール構成が同じ場合はAgentのインスタンスをキャッシュする
+        app_state["session_to_cache_key"] = {} # session_idからツール構成のキーを引くためのマッピング
+        logger.info("共有セッションストアを初期化しました。アプリケーションがリクエストを受け付けます。")
 
     except Exception as e:
         logger.critical(f"アプリケーションの初期化中に致命的なエラーが発生しました: {e}", exc_info=True)
@@ -99,10 +96,24 @@ app.add_middleware(
 )
 
 # --- Pydanticモデル定義（APIのI/Fを定義） ---
+class ToolInfo(BaseModel):
+    name: str
+    description: str
+
+class ToolsListResponse(BaseModel):
+    tools: list[ToolInfo]
+
+class CreateSessionRequest(BaseModel):
+    user_id: str
+    tool_names: list[str]
+
+class CreateSessionResponse(BaseModel):
+    session_id: str
+
 class QueryRequest(BaseModel):
     user_id: str
     query: str
-    session_id: str | None = None
+    session_id: str
 
 class QueryResponse(BaseModel):
     response: str
@@ -124,32 +135,76 @@ def health_check():
     """
     return {"status": "ok"}
 
+@app.get("/tools", response_model=ToolsListResponse, tags=["Agent"])
+def list_tools():
+    """UIが選択肢を表示するために、利用可能なツールの一覧を返します。"""
+    tool_list = [
+        ToolInfo(name=name, description=tool.description)
+        for name, tool in available_tools.items()
+    ]
+    return ToolsListResponse(tools=tool_list)
+
+
+@app.post("/sessions/create", response_model=CreateSessionResponse, tags=["Agent"])
+async def create_session(request: CreateSessionRequest):
+    """
+    選択されたツールでエージェントを初期化（またはキャッシュから取得）し、新しいセッションを開始します。
+    """
+    logger.info(f"新規セッション作成リクエスト (user: {request.user_id}, tools: {request.tool_names})")
+    try:
+        # ツールリストから一意なキャッシュキーを生成（順序を固定するためソート）
+        cache_key = ",".join(sorted(request.tool_names))
+
+        # キャッシュにエージェント（LocalApp）インスタンスがあるか確認
+        local_app = app_state["local_app_cache"].get(cache_key)
+
+        if not local_app:
+            logger.info(f"キャッシュにインスタンスがないため新規作成します (key: {cache_key})")
+    
+            agent = create_facilitator_agent(request.tool_names)
+            local_app = LocalApp(agent=agent)
+            # 作成したインスタンスをキャッシュに保存
+            app_state["local_app_cache"][cache_key] = local_app
+        else:
+            logger.info(f"キャッシュからインスタンスを再利用します (key: {cache_key})")
+
+        # 取得または作成したLocalAppインスタンスでADKセッションを作成
+        session_id = await local_app.create_session(user_id=request.user_id)
+        
+        # 新しいsession_idとキャッシュキーを紐づけて保存
+        app_state["session_to_cache_key"][session_id] = cache_key
+        
+        logger.info(f"新規セッション作成完了: {session_id}")
+        return CreateSessionResponse(session_id=session_id)
+        
+    except Exception as e:
+        logger.error(f"セッション作成中にエラーが発生しました: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="セッションの作成に失敗しました。")
+
 
 @app.post("/query", response_model=QueryResponse, tags=["Agent"])
 async def query_agent(request: QueryRequest):
     """
     Agent Engineに問い合わせを行い、応答を取得します。
-    セッションIDが指定されていない場合は、新しいセッションを自動的に作成します。
     """
-    # lifespanで初期化が完了しているため、app_stateから常にagentインスタンスを取得できる
-    local_agent = app_state.get("local_agent")
-    if not local_agent:
-        # 基本的にこのエラーは発生しないはずだが、念のためハンドリング
-        raise HTTPException(status_code=503, detail="サービスが利用できません。")
+    # session_idから、どのツール構成（キャッシュキー）が使われたかを取得
+    cache_key = app_state["session_to_cache_key"].get(request.session_id)
+    if not cache_key:
+        raise HTTPException(status_code=404, detail=f"セッション設定が見つかりません: {request.session_id}")
 
+    # Agent の初期化
+    local_app = app_state["local_app_cache"].get(cache_key)
+    if not local_app:
+        raise HTTPException(status_code=500, detail=f"内部エラー: セッションに対応するエージェントが見つかりません")
+    
     current_session_id = request.session_id
     user_id = request.user_id
+    logger.info(f"クエリ受信 (session_id: {request.session_id}, cache_key: {cache_key})")
 
+    # Agentに問い合わせをストリーミング
     try:
-        # セッションIDがない場合は新しいセッションを作成
-        if not current_session_id:
-            logger.info(f"新規セッションを作成します (user_id: {user_id})")
-            current_session_id = await local_agent.create_session(user_id=user_id)
-            logger.info(f"新規セッション作成完了: {current_session_id}")
-
-        # Agentに問い合わせをストリーミング
         logger.info(f"Agentに問い合わせ中 (session_id: {current_session_id})")
-        response_stream = await local_agent.stream(
+        response_stream = await local_app.stream(
             query=request.query,
             session_id=current_session_id,
             user_id=user_id
