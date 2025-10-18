@@ -4,6 +4,7 @@ import uuid
 import asyncio
 import logging
 import time
+import pprint
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, APIRouter, HTTPException, Request
@@ -211,7 +212,10 @@ async def query_agent(request: QueryRequest):
         )
 
         # ストリームから応答を連結して完全なレスポンスを作成
-        response_parts = [_parse_agent_event(event) async for event in response_stream]
+        response_parts = []
+        async for event in response_stream:
+            response_parts.append(_parse_agent_event(event))
+
         full_response = "".join(response_parts)
 
         logger.info(f"Agentからの最終応答長: {len(full_response)}")
@@ -229,9 +233,21 @@ async def query_agent(request: QueryRequest):
 def _parse_agent_event(event: dict | object) -> str:
     """Agentからのイベントをパースして、テキスト部分を抽出するヘルパー関数。"""
     if (event.content and event.content.parts):
-        response = '\n'.join([p.text for p in event.content.parts if p.text])
-        if response:
-            return response
+        parts_text = []
+        for part in event.content.parts:
+            if part.text:
+                # partにtext属性があれば、それを追加
+                parts_text.append(part.text)
+            elif part.function_response:
+                # partにfunction_response属性があれば、その中の 'result' を文字列として追加
+                if (hasattr(part.function_response, 'response') and
+                    isinstance(part.function_response.response, dict) and
+                    'result' in part.function_response.response):                 
+                    function_name = part.function_response.name
+                    result_data = part.function_response.response['result']
+                    if isinstance(result_data, str):
+                        parts_text.append(f"{function_name}: {result_data}")
+        return "\n".join(parts_text)
     else:
         logger.warning("Agent からのメッセージが空でした")
         return "Agent からのメッセージが空でした"
