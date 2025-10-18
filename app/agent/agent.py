@@ -23,34 +23,40 @@ available_tools = {
     "CriticAgent": critic_agent,
 }
 
+tools_default = []
+available_tools_prompt_default = ""
+for name, tool in available_tools.items():
+    tools_default.append(agent_tool.AgentTool(agent=tool))
+    available_tools_prompt_default += f"- {name}: {tool.description}\n"
+
 # デフォルトのファシリ Agent
 facilitator_agent_default = LlmAgent(
     name="Facilitator",
     model="gemini-2.5-flash",
-    instruction=FACILITATOR_INSTRUCTIONS,
-    tools=[agent_tool.AgentTool(agent=idea_agent), agent_tool.AgentTool(agent=critic_agent)]
+    instruction=FACILITATOR_INSTRUCTIONS.format(available_tools_prompt=available_tools_prompt_default.strip()),
+    tools=tools_default
     # Alternatively, could use LLM Transfer if research_assistant is a sub_agent
 )
 
 root_agent = facilitator_agent_default
 
 # ファクトリ関数
-# TODO: 動的にファシリのインストラクションを変更
 def create_facilitator_agent(selected_tool_names: list[str]) -> LlmAgent:
     """
     選択されたツールのリストに基づいて、ファシリテーターエージェントを動的に生成します。
     """
-    selected_tools = [
-        agent_tool.AgentTool(agent=available_tools[name])
-        for name in selected_tool_names
-        if name in available_tools
-    ]
-    
+    selected_tools = []
+    available_tools_prompt = ""
+    for name in selected_tool_names:
+        if name in available_tools:
+            selected_tools.append(agent_tool.AgentTool(agent=available_tools[name]))
+            available_tools_prompt += f"- {name}: {available_tools[name].description}\n"
+            
     facilitator_agent = LlmAgent(
         name="Facilitator",
         model="gemini-2.5-flash",
         description="会議の議論をリードするファシリテータAgentです。",
-        instruction=FACILITATOR_INSTRUCTIONS,
+        instruction=FACILITATOR_INSTRUCTIONS.format(available_tools_prompt=available_tools_prompt.strip()),
         tools=selected_tools
     )
     return facilitator_agent
